@@ -68,7 +68,7 @@ jobs:
           # The hub's `AGENT_SIGNING_KEY` (src/main.rs in the hub repository).
           PUBLIC_KEY: |
             -----BEGIN PUBLIC KEY-----
-            MCowBQYDK2VwAyEAmnxeKfh5WgpyEj7h8GqTQfKVNNvChbmrvuagBtxl7u8=
+            MCowBQYDK2VwAyEATGVSH4REkcKS5JrEq/ZXw/tTB7+tDR8ajfPnh6SP80I=
             -----END PUBLIC KEY-----
       # A manual dispatch builds and signs the binaries; only a tag publishes,
       # so the path can be exercised without cutting a release. gh ships on the

@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ struct Args {
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+    allow_upgrade: bool,
 }
 
 fn usage() -> ! {
@@ -41,6 +43,8 @@ fn usage() -> ! {
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
                                 from what would be counted. Full names only.\n  \
+           --allow-upgrade      Accept authenticated hub self-update commands;\n                       \
+                                the executable's directory must be writable.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",
@@ -51,6 +55,7 @@ fn usage() -> ! {
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let mut allow_upgrade = std::env::var("MONITOR_ALLOW_UPGRADE").as_deref() == Ok("1");
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -60,6 +65,11 @@ fn parse_args() -> Result<Args> {
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
+            "--allow-upgrade" => allow_upgrade = true,
+            "--version" => {
+                println!("monitor-agent {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -68,7 +78,7 @@ fn parse_args() -> Result<Args> {
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, allow_upgrade })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -181,6 +191,7 @@ fn remaining(last_frame: Instant) -> Duration {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
+    let mut updater = upgrade::Updater::new(args.allow_upgrade, &url)?;
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes and a user of its own, which keep some disks out of the
     // totals. The unit file owns that decision, but the discrepancy must not go
@@ -214,12 +225,15 @@ async fn main() -> Result<()> {
     let mut wait = 0u64;
 
     loop {
+        updater.recover_if_due()?;
         // Set by `session` once the handshake completes, so a connect that
         // never finished cannot pass its CONNECT_DEADLINE off as a session
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) =
+            session(&url, &args.token, &mut collector, args.interval, &mut connected, &mut updater).await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -298,6 +312,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
+    updater: &mut upgrade::Updater,
 ) -> Result<()> {
     let request = authorized(url, token)?;
     let config =
@@ -341,8 +356,17 @@ async fn session(
     let mut hello = serde_json::to_value(&facts)?;
     if let Some(fields) = hello.as_object_mut() {
         fields.extend(collector.capacities().map(|(k, v)| (k.to_owned(), v.into())));
+        fields.insert("can_upgrade".into(), updater.enabled.into());
+        if let Some(id) = &updater.confirmation {
+            fields.insert("upgrade_id".into(), id.clone().into());
+        }
     }
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
+    updater.confirmed();
+    if let Some(progress) = &updater.progress {
+        send(&mut ws, notify("upgrade.result", serde_json::to_value(progress)?), remaining(last_frame))
+            .await?;
+    }
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -359,6 +383,17 @@ async fn session(
 
     let result = loop {
         tokio::select! {
+            outcome = updater.finished() => {
+                let progress = updater.finish(outcome);
+                let sent = send(&mut ws, notify("upgrade.result", serde_json::to_value(progress)?), remaining(last_frame)).await;
+                // A lost progress frame does not cancel an already authorised
+                // update. The replacement confirms itself on its new connection.
+                if let Err(e) = updater.restart() {
+                    let progress = updater.restart_failed(e);
+                    if let Err(e) = send(&mut ws, notify("upgrade.result", serde_json::to_value(progress)?), remaining(last_frame)).await { break Err(e); }
+                }
+                if let Err(e) = sent { break Err(e); }
+            }
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
@@ -371,7 +406,10 @@ async fn session(
                 if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
                     glimpse_from(&fresh);
                 }
-                let hello = notify("hello", serde_json::to_value(&fresh)?);
+                let mut hello = serde_json::to_value(&fresh)?;
+                hello["can_upgrade"] = updater.enabled.into();
+                if let Some(id) = &updater.confirmation { hello["upgrade_id"] = id.clone().into(); }
+                let hello = notify("hello", hello);
                 if let Err(e) = send(&mut ws, hello, remaining(last_frame)).await { break Err(e); }
                 facts = fresh;
             }
@@ -391,10 +429,19 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                            if rpc.method == "ping.tasks" {
-                                if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                            match rpc.method.as_str() {
+                                "ping.tasks" => {
+                                    if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
+                                        respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                    }
                                 }
+                                "agent.upgrade" => match serde_json::from_value::<upgrade::Request>(rpc.params).map_err(anyhow::Error::from).and_then(|request| updater.request(request)) {
+                                    Ok(progress) => {
+                                        if let Err(e) = send(&mut ws, notify("upgrade.result", serde_json::to_value(progress)?), remaining(last_frame)).await { break Err(e); }
+                                    }
+                                    Err(e) => eprintln!("invalid upgrade command: {e:#}"),
+                                },
+                                _ => {}
                             }
                         }
                     }

@@ -1,6 +1,6 @@
 # monitor-agent
 
-[monitor](https://github.com/monitor-probe/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
+[monitor](https://github.com/Su-cyber-art/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
 
 静态链接单文件，无运行时依赖，常驻内存数 MB。
 
@@ -8,7 +8,7 @@
 
 - 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
-- 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
+- 监控数据不写本地文件，流量累加由 hub 负责；启用远程升级时仅在自身目录保存下载和回退文件
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
 
@@ -20,7 +20,8 @@
 curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --token <token>
 ```
 
-安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
+安装脚本识别 systemd 与 OpenRC，实际二进制装到 `/opt/monitor/agent/monitor-agent`，
+`/opt/monitor/monitor-agent` 保留为链接，token 写入
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 
 ## 运行
@@ -35,6 +36,16 @@ monitor-agent --server https://your-hub --token <token>
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
 | `--iface` | 空 | 流量统计的网卡，逗号分隔，也可用 `MONITOR_IFACE`；见下 |
+| `--allow-upgrade` | 关闭 | 接受主控的远程升级指令；也可用 `MONITOR_ALLOW_UPGRADE=1`，安装脚本默认开启 |
+| `--version` | — | 打印版本并退出 |
+
+### 远程升级
+
+v1.3.0 起配合新版 hub，可在后台选择多台在线节点统一升级。旧节点需要先运行一次新版安装脚本的 `--upgrade`，以安装新协议和可写目录；后续无需逐台执行升级命令。
+
+agent 以普通用户运行，只能修改自己的二进制目录。收到 `agent.upgrade` 的 `{id, version}` 后，从现有主控下载指定版本，校验 Linux 架构和 `--version` 输出，在保留旧二进制的同时原子替换自身并 `exec`。下载期间监控和探测继续运行，token、网卡和采样间隔沿用原有设置。
+
+新进程的 `hello` 带回实际版本和请求 ID，由 hub 确认完成。90 秒仍不能连接主控时恢复旧二进制；确认之前若进程被服务管理器重新启动，也会读取本地升级记录并回退。`upgrade.result` 会回报下载、切换和失败状态。
 
 ### 统计哪些网卡的流量
 
