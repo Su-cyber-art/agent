@@ -888,7 +888,21 @@ mod tests {
         hole.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let hole = hole.listen(0).unwrap();
         let dead = hole.local_addr().unwrap();
-        let _queued = std::net::TcpStream::connect(dead).unwrap();
+        // Kernels round a zero backlog differently. Keep every accepted socket
+        // alive and fill the actual queue before using it as a black hole.
+        let mut queued = Vec::new();
+        loop {
+            match std::net::TcpStream::connect_timeout(&dead, Duration::from_millis(100)) {
+                Ok(stream) => {
+                    queued.push(stream);
+                    assert!(queued.len() < 128, "could not fill the loopback listen queue");
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                    break;
+                }
+            }
+        }
         let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = live.local_addr().unwrap();
 

@@ -43,6 +43,44 @@ jobs:
         run: cross build --release --locked --target ${{ matrix.target }}
       - if: runner.os != 'Linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+      # Exercise the actual installers on disposable native runners before
+      # uploading an artifact. Cross-built architectures are checked above.
+      - if: runner.os != 'Linux'
+        uses: actions/checkout@v7
+        with:
+          repository: Su-cyber-art/monitor
+          ref: main
+          path: installers
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /install.ps1
+            /install-macos.sh
+      - if: runner.os == 'Windows' && runner.arch == 'X64' && matrix.target == 'x86_64-pc-windows-msvc'
+        name: Verify Windows service installation and upgrade
+        shell: pwsh
+        run: |
+          $binary = "$PWD/target/${{ matrix.target }}/release/monitor-agent.exe"
+          try {
+            & ./installers/install.ps1 -Server http://127.0.0.1:1 -Token ci-test-token -Interval 2 -Binary $binary
+            & ./installers/install.ps1 -Upgrade -Binary $binary
+            $saved = Get-Content "$env:ProgramData/monitor/agent.json" -Raw | ConvertFrom-Json
+            if ($saved.MONITOR_TOKEN -ne 'ci-test-token' -or $saved.MONITOR_INTERVAL -ne '2') { throw 'Upgrade did not preserve configuration' }
+            if ((Get-Service monitor-agent).Status -ne 'Running') { throw 'Agent service is not running' }
+          } finally {
+            & ./installers/install.ps1 -Uninstall
+          }
+      - if: runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.target == 'aarch64-apple-darwin'
+        name: Verify macOS launchd installation and upgrade
+        run: |
+          trap 'sudo sh installers/install-macos.sh --uninstall' EXIT
+          BINARY="$PWD/target/${{ matrix.target }}/release/monitor-agent"
+          sudo sh installers/install-macos.sh --server http://127.0.0.1:1 --token ci-test-token --interval 2 --binary "$BINARY"
+          sudo sh installers/install-macos.sh --upgrade --binary "$BINARY"
+          sudo grep -qx 'MONITOR_TOKEN=ci-test-token' /usr/local/monitor/agent.env
+          sudo grep -qx 'MONITOR_INTERVAL=2' /usr/local/monitor/agent.env
+          sudo launchctl print system/dev.monitor.agent | grep -q 'state = running'
       # install.sh downloads exactly this name; changing it breaks every
       # install command the hub issues.
       - run: cp "target/${{ matrix.target }}/release/monitor-agent${{ matrix.ext }}" "monitor-agent-${{ matrix.target }}${{ matrix.ext }}"
