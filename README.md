@@ -1,12 +1,12 @@
 # monitor-agent
 
-[monitor](https://github.com/Su-cyber-art/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
+[monitor](https://github.com/Su-cyber-art/monitor) 的跨平台 agent（Linux、Windows、macOS）。采集本机指标，经 WebSocket 上报 hub。
 
-静态链接单文件，无运行时依赖，常驻内存数 MB。
+Linux 使用 musl 静态链接单文件；Windows 和 macOS 发布各自的原生程序。
 
 ## 特性
 
-- 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
+- Linux 直接读 `/proc`、`/sys/class/net` 与 `statvfs`；Windows/macOS 使用原生系统接口（sysinfo）采集
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
 - 监控数据不写本地文件，流量累加由 hub 负责；启用远程升级时仅在自身目录保存下载和回退文件
 - token 走 `Authorization` 头，不进反向代理的 access log
@@ -14,13 +14,13 @@
 
 ## 安装
 
-在 hub 的面板添加节点，复制生成的命令在目标主机执行：
+在 hub 的面板添加节点，选择目标系统，复制生成的命令在目标主机执行。Linux 示例：
 
 ```bash
 curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --token <token>
 ```
 
-安装脚本识别 systemd 与 OpenRC，实际二进制装到 `/opt/monitor/agent/monitor-agent`，
+Linux 安装脚本识别 systemd 与 OpenRC，实际二进制装到 `/opt/monitor/agent/monitor-agent`，
 `/opt/monitor/monitor-agent` 保留为链接，token 写入
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 
@@ -43,7 +43,7 @@ monitor-agent --server https://your-hub --token <token>
 
 v1.3.0 起配合新版 hub，可在后台选择多台在线节点统一升级。旧节点需要先运行一次新版安装脚本的 `--upgrade`，以安装新协议和可写目录；后续无需逐台执行升级命令。
 
-agent 以普通用户运行，只能修改自己的二进制目录。收到 `agent.upgrade` 的 `{id, version}` 后，从现有主控下载指定版本，校验 Linux 架构和 `--version` 输出，在保留旧二进制的同时原子替换自身并 `exec`。下载期间监控和探测继续运行，token、网卡和采样间隔沿用原有设置。
+agent 以普通用户运行，只能修改自己的二进制目录。收到 `agent.upgrade` 的 `{id, version}` 后，从现有主控下载指定版本，校验操作系统、架构和 `--version` 输出，在保留旧二进制的同时替换自身并重启（Unix 使用 `exec`，Windows 服务使用 SCM 的恢复策略）。下载期间监控和探测继续运行，token、网卡和采样间隔沿用原有设置。
 
 新进程的 `hello` 带回实际版本和请求 ID，由 hub 确认完成。90 秒仍不能连接主控时恢复旧二进制；确认之前若进程被服务管理器重新启动，也会读取本地升级记录并回退。`upgrade.result` 会回报下载、切换和失败状态。
 
@@ -92,8 +92,20 @@ cargo test
 cargo clippy --all-targets
 ```
 
-发布产物为 musl 静态链接二进制，推送 `v*` tag 由 `.github/workflows/release.yml` 构建。
+发布包含 Linux musl、Windows MSVC `.exe`、macOS Mach-O 三个平台的 x86_64 / aarch64 程序及 Ed25519 签名。推送与 Cargo.toml 版本一致的 `v*` tag，由 `.github/workflows/release.yml` 构建。CI 在 Linux、Windows、macOS 上分别执行测试和 clippy。
 
 ## 许可
 
 MIT
+
+## Windows 与 macOS
+
+需要 hub v1.8.0 或更新版本，并发布 agent v1.4.0 或更新版本的全部平台产物和签名；旧 hub 的下载接口只提供 Linux 程序。面板「安装 Agent」与「批量添加」可选择目标系统，已上报节点会预选对应系统。
+
+- Windows：在管理员 PowerShell 执行面板命令，安装为 `monitor-agent` 原生 Windows 服务，使用 LocalService 账户。程序位于 `%ProgramData%\monitor\agent\monitor-agent.exe`，凭证位于受 ACL 保护的 `%ProgramData%\monitor\agent.json`。使用 `Get-Service monitor-agent` 查看状态。手动更新、卸载分别运行安装脚本的 `-Upgrade`、`-Uninstall`。
+- macOS：以 root 执行面板命令，安装为 `dev.monitor.agent` launchd 服务，使用独立 `_monitor-agent` 账户。程序位于 `/usr/local/monitor/agent/monitor-agent`，服务定义位于 `/Library/LaunchDaemons/dev.monitor.agent.plist`，日志位于 `/usr/local/monitor/agent.log`。安装脚本支持 `--upgrade` 和 `--uninstall`。
+- 两个平台均支持 CPU、内存、swap、磁盘、网卡流量、进程数量、运行时间、TCP 探测及远程升级。Windows 网卡名支持空格，例如 `--iface "Ethernet 2,-Wi-Fi"`；默认排除回环和常见虚拟网卡，特殊网络使用 `--iface` 指定。
+- Windows 没有 Unix 的 1/5/15 分钟负载，兼容字段上报 `[0,0,0]`。Windows/macOS 暂不识别虚拟化类型；TCP/UDP 数量为系统允许当前账户枚举的 socket 数量。macOS 磁盘统计排除重复的系统卷，使用系统提供的可用容量口径。
+- 流量计数仍由 hub 累加；启动标识包含系统启动时间和所选网卡集合，网卡增减会重新对齐基线。
+
+本机前台调试可以直接运行 `monitor-agent[.exe] --server https://your-hub --token TOKEN`。服务模式下的配置文件由安装脚本维护。

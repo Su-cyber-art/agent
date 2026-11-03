@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
@@ -59,11 +59,32 @@ fn save_pending(executable: &Path, pending: &Pending) -> Result<()> {
     Ok(())
 }
 
-fn rollback(executable: &Path) -> Result<()> {
+#[cfg(unix)]
+fn launch(executable: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    std::fs::rename(sibling(executable, "previous"), executable).context("restoring previous agent")?;
     Err(std::process::Command::new(executable).args(std::env::args_os().skip(1)).exec())
-        .context("starting previous agent")
+        .context("starting agent")
+}
+
+#[cfg(windows)]
+fn launch(executable: &Path) -> Result<()> {
+    if std::env::args().any(|arg| arg == "--service") {
+        // SCM's configured recovery action starts the new image in the service.
+        std::process::exit(1);
+    }
+    std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+        .context("starting agent")?;
+    std::process::exit(0);
+}
+
+fn rollback(executable: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::rename(sibling(executable, "previous"), executable).context("restoring previous agent")?;
+    #[cfg(windows)]
+    replace(executable, &sibling(executable, "previous"), &sibling(executable, "failed"))?;
+    launch(executable)
 }
 
 pub struct Updater {
@@ -109,7 +130,7 @@ impl Updater {
             Err(e) => return Err(e).context("reading pending agent upgrade"),
         }
         Ok(Self {
-            enabled: enabled && cfg!(target_os = "linux"),
+            enabled,
             executable,
             base,
             job: None,
@@ -178,7 +199,6 @@ impl Updater {
     /// Returns only on failure. exec retains the PID, environment and service
     /// sandbox, and works with systemd as well as OpenRC supervision.
     pub fn restart(&mut self) -> Result<()> {
-        use std::os::unix::process::CommandExt;
         let Some(staged) = self.ready.take() else { return Ok(()) };
         let backup = sibling(&self.executable, "previous");
         let job = self.job.as_ref().expect("upgrade request");
@@ -190,8 +210,11 @@ impl Updater {
             std::fs::remove_file(pending_path(&self.executable))?;
             return Err(e);
         }
-        let error = std::process::Command::new(&self.executable).args(std::env::args_os().skip(1)).exec();
+        let error = launch(&self.executable).expect_err("launch only returns on failure");
+        #[cfg(unix)]
         std::fs::rename(&backup, &self.executable).context("could not restore the previous agent")?;
+        #[cfg(windows)]
+        replace(&self.executable, &backup, &sibling(&self.executable, "failed"))?;
         std::fs::remove_file(pending_path(&self.executable))?;
         Err(error).context("could not start the new agent; previous binary restored")
     }
@@ -229,11 +252,17 @@ impl Updater {
 }
 
 fn sibling(executable: &Path, suffix: &str) -> PathBuf {
-    executable.with_file_name(format!("monitor-agent.{suffix}"))
+    let extension = if cfg!(windows) && matches!(suffix, "download" | "previous" | "failed" | "backup") {
+        ".exe"
+    } else {
+        ""
+    };
+    executable.with_file_name(format!("monitor-agent.{suffix}{extension}"))
 }
 
 /// The old pathname always exists until rename atomically publishes the new
 /// one. A hard link retains the running inode without copying its bytes.
+#[cfg(unix)]
 fn replace(executable: &Path, staged: &Path, backup: &Path) -> Result<()> {
     let link = sibling(executable, "backup");
     if link.exists() {
@@ -244,16 +273,35 @@ fn replace(executable: &Path, staged: &Path, backup: &Path) -> Result<()> {
     std::fs::rename(staged, executable).context("publishing agent update")
 }
 
+// Windows permits renaming the running image, but not overwriting it.
+// Restore the original pathname if publishing the staged image fails.
+#[cfg(windows)]
+fn replace(executable: &Path, staged: &Path, backup: &Path) -> Result<()> {
+    if backup.exists() {
+        std::fs::remove_file(backup)?;
+    }
+    std::fs::rename(executable, backup).context("keeping previous agent")?;
+    if let Err(error) = std::fs::rename(staged, executable) {
+        std::fs::rename(backup, executable).context("restoring agent after failed publication")?;
+        return Err(error).context("publishing agent update");
+    }
+    Ok(())
+}
+
 async fn download(base: &str, version: &str, executable: &Path) -> Result<PathBuf> {
     let staged = sibling(executable, "download");
     let operation = async {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
         let url = format!("{base}/agent/{}", std::env::consts::ARCH);
         let mut response = None;
+        let mut query = vec![("version", version)];
+        if !cfg!(target_os = "linux") {
+            query.push(("os", std::env::consts::OS));
+        }
         // The relay has four slots. A batch can legitimately fill them; retry
         // its explicit 503 and connection failures within the overall budget.
         for attempt in 0..3 {
-            let fetched = client.get(&url).query(&[("version", version)]).send().await;
+            let fetched = client.get(&url).query(&query).send().await;
             match fetched {
                 Ok(res) if res.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || attempt == 2 => {
                     response = Some(res);
@@ -297,23 +345,16 @@ async fn download(base: &str, version: &str, executable: &Path) -> Result<PathBu
 }
 
 async fn validate(path: &Path, version: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncReadExt;
-    let mut head = [0u8; 20];
-    tokio::fs::File::open(path).await?.read_exact(&mut head).await?;
-    let machine = match std::env::consts::ARCH {
-        "x86_64" => 62,
-        "aarch64" => 183,
-        other => bail!("unsupported architecture {other}"),
-    };
+    let binary = tokio::fs::read(path).await?;
     anyhow::ensure!(
-        &head[..4] == b"\x7fELF"
-            && head[4] == 2
-            && head[5] == 1
-            && u16::from_le_bytes([head[18], head[19]]) == machine,
-        "download is not an agent binary for this architecture"
+        crate::platform::built_for(&binary, std::env::consts::OS, std::env::consts::ARCH),
+        "download is not an agent binary for this platform"
     );
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).await?;
+    }
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new(path).arg("--version").kill_on_drop(true).output(),
@@ -333,6 +374,34 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_windows_image_can_be_replaced() {
+        if std::env::var_os("MONITOR_TEST_REPLACE").is_some() {
+            let executable = std::env::current_exe().unwrap();
+            replace(&executable, &sibling(&executable, "download"), &sibling(&executable, "previous"))
+                .unwrap();
+            return;
+        }
+        let scratch = Scratch::new();
+        let executable = scratch.0.join("monitor-agent.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::write(sibling(&executable, "download"), b"replacement").unwrap();
+        let output = std::process::Command::new(&executable)
+            .args(["--exact", "upgrade::tests::a_running_windows_image_can_be_replaced", "--nocapture"])
+            .env("MONITOR_TEST_REPLACE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&executable).unwrap(), b"replacement");
+        assert!(sibling(&executable, "previous").metadata().unwrap().len() > 1024);
+    }
 
     struct Scratch(PathBuf);
     impl Scratch {
@@ -369,6 +438,8 @@ mod tests {
         let mut held = Vec::new();
         running.read_to_end(&mut held).unwrap();
         assert_eq!(held, b"old", "the running process still holds its original inode");
+        drop(running);
+        std::fs::remove_file(&current).unwrap();
         std::fs::rename(&backup, &current).unwrap();
         assert_eq!(std::fs::read(&current).unwrap(), b"old");
         assert!(replace(&current, &staged, &backup).is_err());
@@ -393,7 +464,14 @@ mod tests {
                 let mut request = vec![0; 2048];
                 let count = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
-                assert!(request.starts_with(&format!("GET /agent/{}?version=1.3.1 ", std::env::consts::ARCH)));
+                let os = if cfg!(target_os = "linux") {
+                    String::new()
+                } else {
+                    format!("&os={}", std::env::consts::OS)
+                };
+                assert!(
+                    request.starts_with(&format!("GET /agent/{}?version=1.3.1{os} ", std::env::consts::ARCH))
+                );
                 stream
                     .write_all(
                         format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n")
@@ -430,6 +508,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_reconnect_timeout_restores_the_previous_binary_and_keeps_the_rollback_receipt() {
         let scratch = Scratch::new();

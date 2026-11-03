@@ -1,6 +1,9 @@
-//! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
+//! monitor-agent: reports one host to a monitor hub over WebSocket.
 
 mod collect;
+mod platform;
+#[cfg(windows)]
+mod service;
 mod upgrade;
 
 use std::time::Duration;
@@ -54,7 +57,10 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let interval = std::env::var("MONITOR_INTERVAL").unwrap_or_else(|_| "1".into()).parse::<u64>()?;
+    let insecure = std::env::var("MONITOR_INSECURE").as_deref() == Ok("1");
+    let (mut server, mut token, mut interval, mut iface, mut insecure) =
+        (None, None, interval, None, insecure);
     let mut allow_upgrade = std::env::var("MONITOR_ALLOW_UPGRADE").as_deref() == Ok("1");
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -66,6 +72,8 @@ fn parse_args() -> Result<Args> {
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
             "--allow-upgrade" => allow_upgrade = true,
+            #[cfg(windows)]
+            "--service" => {}
             "--version" => {
                 println!("monitor-agent {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -187,31 +195,46 @@ fn remaining(last_frame: Instant) -> Duration {
     HUB_SILENCE.saturating_sub(last_frame.elapsed())
 }
 
+fn main() -> Result<()> {
+    #[cfg(windows)]
+    if std::env::args().any(|arg| arg == "--service") {
+        return service::dispatch();
+    }
+    run()
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
+    run_agent().await
+}
+
+async fn run_agent() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     let mut updater = upgrade::Updater::new(args.allow_upgrade, &url)?;
-    // Reported once at startup. install.sh hardens this unit with
-    // ProtectHome=yes and a user of its own, which keep some disks out of the
-    // totals. The unit file owns that decision, but the discrepancy must not go
-    // unreported. PID 1's table names every disk the sandbox hides; where /proc
-    // hides PID 1, this namespace's own table still shows a covered /home.
-    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    match std::fs::read_to_string("/proc/1/mounts") {
-        Ok(host) => {
-            for mount in collect::hidden_mounts(&host, &mounts) {
-                eprintln!("{mount} is not visible to this service and is not counted toward disk totals");
+    #[cfg(target_os = "linux")]
+    {
+        // Reported once at startup. install.sh hardens this unit with
+        // ProtectHome=yes and a user of its own, which keep some disks out of the
+        // totals. The unit file owns that decision, but the discrepancy must not go
+        // unreported. PID 1's table names every disk the sandbox hides; where /proc
+        // hides PID 1, this namespace's own table still shows a covered /home.
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        match std::fs::read_to_string("/proc/1/mounts") {
+            Ok(host) => {
+                for mount in collect::hidden_mounts(&host, &mounts) {
+                    eprintln!("{mount} is not visible to this service and is not counted toward disk totals");
+                }
+            }
+            Err(_) => {
+                for mount in collect::shadowed_mounts(&mounts) {
+                    eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+                }
             }
         }
-        Err(_) => {
-            for mount in collect::shadowed_mounts(&mounts) {
-                eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
-            }
+        for (mount, e) in collect::unreadable_mounts(&mounts) {
+            eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
         }
-    }
-    for (mount, e) in collect::unreadable_mounts(&mounts) {
-        eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
     }
     let mut collector = Collector::new(args.ifaces);
     // Reported once at startup: an interface summed twice otherwise shows only
@@ -874,7 +897,11 @@ mod tests {
         assert_eq!(stream.peer_addr().unwrap(), live);
         assert_eq!(started.elapsed(), DIAL_FALLBACK, "the dead address costs the fallback and no more");
         let e = connect_first(&[dead, "127.0.0.1:1".parse().unwrap()]).await.unwrap_err().to_string();
-        assert!(e.contains("timed out") && e.contains("refused"), "each failure is named: {e}");
+        // The OS localizes connection-refused messages (for example on Windows).
+        assert!(
+            e.contains(&format!("{dead}: timed out")) && e.contains("127.0.0.1:1:"),
+            "each failure is named: {e}"
+        );
     }
 
     /// Where `localhost` resolves to ::1 before 127.0.0.1, only the preference

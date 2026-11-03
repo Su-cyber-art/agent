@@ -1,9 +1,9 @@
 [package]
 name = "monitor-agent"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 license = "MIT"
-description = "Linux monitoring agent for the monitor hub"
+description = "Cross-platform monitoring agent for the monitor hub"
 repository = "https://github.com/Su-cyber-art/agent"
 
 [dependencies]
@@ -13,7 +13,6 @@ serde_json = "1"
 # A single-threaded runtime suffices: one report every few seconds plus a
 # handful of TCP probes.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "fs", "process"] }
-rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # tokio-tungstenite leaves the crypto provider to the caller: rustls
 # selects one automatically only when exactly one provider feature is enabled.
@@ -22,6 +21,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 if-addrs = "0.15.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+sysinfo = { version = "0.37", default-features = false, features = ["system", "disk", "network"] }
+netstat2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
 
 [dev-dependencies]
 # Only the tests need a movable clock; the write-deadline arithmetic spans

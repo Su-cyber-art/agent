@@ -16,7 +16,11 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     # A hanging test would otherwise consume the six-hour default; the suite
     # runs in well under a second.
     timeout-minutes: 15
@@ -32,13 +36,17 @@ jobs:
       # This commit's agent against the latest released hub, through the hub
       # repository's end-to-end script: the reported fields are checked where
       # the hub and the themes read them, not only where they are serialized.
-      - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        uses: actions/checkout@v7
         with:
           repository: monitor-probe/monitor
           path: hub
           sparse-checkout: scripts
-      - run: cargo build
-      - run: |
+      - if: runner.os == 'Linux'
+        run: cargo build
+      - if: runner.os == 'Linux'
+        run: |
           curl -fsSL -o monitor-hub https://github.com/monitor-probe/monitor/releases/latest/download/monitor-hub-x86_64-unknown-linux-musl
           chmod +x monitor-hub
-      - run: hub/scripts/e2e.sh ./monitor-hub target/debug/monitor-agent
+      - if: runner.os == 'Linux'
+        run: hub/scripts/e2e.sh ./monitor-hub target/debug/monitor-agent
