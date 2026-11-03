@@ -24,8 +24,8 @@ jobs:
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-latest, ext: "" }
           - { target: x86_64-pc-windows-msvc, runner: windows-latest, ext: ".exe" }
           - { target: aarch64-pc-windows-msvc, runner: windows-latest, ext: ".exe" }
-          - { target: x86_64-apple-darwin, runner: macos-latest, ext: "" }
-          - { target: aarch64-apple-darwin, runner: macos-latest, ext: "" }
+          - { target: x86_64-apple-darwin, runner: macos-15-intel, ext: "" }
+          - { target: aarch64-apple-darwin, runner: macos-15-intel, ext: "" }
     steps:
       - uses: actions/checkout@v7
       # A v* tag can be neither moved nor deleted, so one that disagrees with the
@@ -71,7 +71,7 @@ jobs:
           } finally {
             & ./installers/install.ps1 -Uninstall
           }
-      - if: runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.target == 'aarch64-apple-darwin'
+      - if: runner.os == 'macOS' && matrix.target == 'x86_64-apple-darwin'
         name: Verify macOS launchd installation and upgrade
         run: |
           trap 'sudo sh installers/install-macos.sh --uninstall' EXIT
