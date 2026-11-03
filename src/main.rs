@@ -886,9 +886,9 @@ mod tests {
     async fn a_black_holed_address_gives_way_to_the_next_within_the_fallback() {
         let hole = tokio::net::TcpSocket::new_v4().unwrap();
         hole.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let hole = hole.listen(0).unwrap();
+        let hole = hole.listen(1).unwrap();
         let dead = hole.local_addr().unwrap();
-        // Kernels round a zero backlog differently. Keep every accepted socket
+        // Kernels round the backlog differently. Keep every accepted socket
         // alive and fill the actual queue before using it as a black hole.
         let mut queued = Vec::new();
         loop {
