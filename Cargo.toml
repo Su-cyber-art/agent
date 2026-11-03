@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 license = "MIT"
 description = "Cross-platform monitoring agent for the monitor hub"
@@ -20,10 +20,10 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 if-addrs = "0.15.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 sysinfo = { version = "0.37", default-features = false, features = ["system", "disk", "network"] }

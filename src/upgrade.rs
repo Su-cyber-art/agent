@@ -101,6 +101,11 @@ pub struct Updater {
 }
 
 impl Updater {
+    #[cfg(target_os = "linux")]
+    pub fn busy(&self) -> bool {
+        self.task.is_some() || self.ready.is_some() || (self.confirmation.is_some() && !self.confirmed)
+    }
+
     pub fn new(enabled: bool, ws_url: &str) -> Result<Self> {
         let base = ws_url.strip_suffix("/api/agent/ws").context("unexpected agent WebSocket URL")?;
         let base = base.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);

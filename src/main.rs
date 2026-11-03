@@ -4,6 +4,8 @@ mod collect;
 mod platform;
 #[cfg(windows)]
 mod service;
+#[cfg(target_os = "linux")]
+mod uninstall;
 mod upgrade;
 
 use std::time::Duration;
@@ -203,12 +205,33 @@ fn main() -> Result<()> {
     run()
 }
 
+fn can_uninstall() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        uninstall::enabled()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run() -> Result<()> {
     run_agent().await
 }
 
 async fn run_agent() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--uninstall-protocol") {
+        println!("1");
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--uninstall-helper") {
+        anyhow::ensure!(std::env::args_os().len() == 2, "uninstall helper takes no arguments");
+        return uninstall::helper().await;
+    }
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     let mut updater = upgrade::Updater::new(args.allow_upgrade, &url)?;
@@ -380,6 +403,7 @@ async fn session(
     if let Some(fields) = hello.as_object_mut() {
         fields.extend(collector.capacities().map(|(k, v)| (k.to_owned(), v.into())));
         fields.insert("can_upgrade".into(), updater.enabled.into());
+        fields.insert("can_uninstall".into(), can_uninstall().into());
         if let Some(id) = &updater.confirmation {
             fields.insert("upgrade_id".into(), id.clone().into());
         }
@@ -431,6 +455,7 @@ async fn session(
                 }
                 let mut hello = serde_json::to_value(&fresh)?;
                 hello["can_upgrade"] = updater.enabled.into();
+                hello["can_uninstall"] = can_uninstall().into();
                 if let Some(id) = &updater.confirmation { hello["upgrade_id"] = id.clone().into(); }
                 let hello = notify("hello", hello);
                 if let Err(e) = send(&mut ws, hello, remaining(last_frame)).await { break Err(e); }
@@ -463,6 +488,13 @@ async fn session(
                                         if let Err(e) = send(&mut ws, notify("upgrade.result", serde_json::to_value(progress)?), remaining(last_frame)).await { break Err(e); }
                                     }
                                     Err(e) => eprintln!("invalid upgrade command: {e:#}"),
+                                },
+                                #[cfg(target_os = "linux")]
+                                "agent.uninstall" => match uninstall::request(rpc.params, updater.busy()).await {
+                                    Ok(progress) => {
+                                        if let Err(e) = send(&mut ws, notify("uninstall.result", serde_json::to_value(progress)?), remaining(last_frame)).await { break Err(e); }
+                                    }
+                                    Err(e) => eprintln!("invalid uninstall command: {e:#}"),
                                 },
                                 _ => {}
                             }
@@ -595,9 +627,19 @@ async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
 /// The first of `addrs` to accept, each but the last given [`DIAL_FALLBACK`].
 /// Every failure is kept, so the log names which family failed and how.
 async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+    connect_using(addrs, TcpStream::connect).await
+}
+
+// The dial policy has a controllable I/O boundary: a full kernel listen queue
+// can reset connections instead of stalling, depending on the operating system.
+async fn connect_using<F, Fut>(addrs: &[std::net::SocketAddr], mut connect: F) -> Result<TcpStream>
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
     let mut failures = Vec::new();
     for (i, addr) in addrs.iter().enumerate() {
-        let attempt = TcpStream::connect(addr);
+        let attempt = connect(*addr);
         let result = if i + 1 < addrs.len() {
             tokio::time::timeout(DIAL_FALLBACK, attempt)
                 .await
@@ -878,39 +920,27 @@ mod tests {
         );
     }
 
-    /// A listener whose accept queue is full drops further SYNs rather than
-    /// refusing them: a black hole on loopback. The clock is paused, so the
-    /// fallback deadline elapses as soon as nothing else can progress, while
-    /// without it the connect would wait out the kernel's SYN retries.
+    /// A stalled attempt must give way to a real listener after the fallback
+    /// deadline. No kernel backlog or localized OS error defines the timeout.
     #[tokio::test(start_paused = true)]
     async fn a_black_holed_address_gives_way_to_the_next_within_the_fallback() {
-        let hole = tokio::net::TcpSocket::new_v4().unwrap();
-        hole.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let hole = hole.listen(1).unwrap();
-        let dead = hole.local_addr().unwrap();
-        // Kernels round the backlog differently. Keep every accepted socket
-        // alive and fill the actual queue before using it as a black hole.
-        let mut queued = Vec::new();
-        loop {
-            match std::net::TcpStream::connect_timeout(&dead, Duration::from_millis(100)) {
-                Ok(stream) => {
-                    queued.push(stream);
-                    assert!(queued.len() < 128, "could not fill the loopback listen queue");
-                }
-                Err(error) => {
-                    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-                    break;
-                }
+        let dead: std::net::SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let connect = |address| async move {
+            if address == dead {
+                std::future::pending().await
+            } else {
+                TcpStream::connect(address).await
             }
-        }
+        };
         let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = live.local_addr().unwrap();
 
         let started = Instant::now();
-        let stream = connect_first(&[dead, live]).await.unwrap();
+        let stream = connect_using(&[dead, live], connect).await.unwrap();
         assert_eq!(stream.peer_addr().unwrap(), live);
         assert_eq!(started.elapsed(), DIAL_FALLBACK, "the dead address costs the fallback and no more");
-        let e = connect_first(&[dead, "127.0.0.1:1".parse().unwrap()]).await.unwrap_err().to_string();
+        let e =
+            connect_using(&[dead, "127.0.0.1:1".parse().unwrap()], connect).await.unwrap_err().to_string();
         // The OS localizes connection-refused messages (for example on Windows).
         assert!(
             e.contains(&format!("{dead}: timed out")) && e.contains("127.0.0.1:1:"),
